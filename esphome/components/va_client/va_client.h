@@ -11,6 +11,7 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/portmacro.h>
+#include <freertos/task.h>
 
 namespace esphome {
 namespace va_client {
@@ -87,6 +88,10 @@ class VaClient : public Component {
   void connect_();
   void schedule_reconnect_();
   void on_mic_data_(const std::vector<uint8_t> &samples);
+  static void mic_sender_task_trampoline_(void *arg);
+  void mic_sender_loop_();
+  bool mic_queue_push_(const uint8_t *data, size_t len);
+  void mic_queue_reset_();
   // Tell the backend to drop any uncommitted mic audio NOW. Sent when the mic
   // gate closes mid-stream by TIMER (a follow-up window expiring) — a partial
   // utterance left in OpenAI's input buffer would otherwise be "completed" by a
@@ -94,6 +99,9 @@ class VaClient : public Component {
   // source means no reactive clear-on-wake is needed (that one disturbed the
   // server VAD and caused spurious garbage commits). No-op if nothing buffered.
   void send_mic_flush_();
+  // Tell the backend the entire wake/follow-up conversation is finished.
+  // Unlike flush, this is never sent merely because reply playback gated mic.
+  void send_conversation_end_();
   // Tell the backend a fresh wake started ({"type":"wake"}), for the
   // dangling-VAD guard: a server-VAD end-of-turn before the user speaks is a
   // stale pre-wake segment → backend suppresses its thinking + cancels its
@@ -105,6 +113,9 @@ class VaClient : public Component {
   void preroll_push_(const int16_t *data, size_t n);
   void handle_text_(const char *data, size_t len);
   void handle_binary_(const uint8_t *data, size_t len);
+  void feed_gap_silence_();
+  void fade_ring_head_();
+  void fade_ring_tail_();
   void set_phase_(const std::string &phase);
   // Marshal a phase-LED trigger fire onto the main loop (used to drive the LED
   // ring to `listening`/`idle` from timer callbacks during the follow-up window,
@@ -184,10 +195,29 @@ class VaClient : public Component {
   size_t preroll_count_{0};  // valid samples (<= capacity)
   bool preroll_discard_pending_{false};
 
+  // Microphone callbacks must never wait on esp_websocket_client's internal
+  // mutex. They append PCM to this independent PSRAM ring; one dedicated task
+  // owns all binary websocket sends and retries lock/network stalls without
+  // discarding capture frames. 256 KiB is about 8.2 s at 16 kHz PCM16 mono.
+  static constexpr size_t kMicTxBufferBytes = 256 * 1024;
+  static constexpr size_t kMicTxPacketBytes = 640;  // 20 ms @ 16 kHz mono16
+  uint8_t *mic_tx_buf_{nullptr};
+  size_t mic_tx_head_{0};
+  size_t mic_tx_tail_{0};
+  size_t mic_tx_fill_{0};
+  portMUX_TYPE mic_tx_mux_ = portMUX_INITIALIZER_UNLOCKED;
+  TaskHandle_t mic_sender_task_handle_{nullptr};
+  uint32_t mic_queue_overflow_count_{0};
+  uint32_t mic_queue_generation_{0};
+
   // Streaming gate. True while the mic should be forwarded to the server:
   //   - between wake-word start_session() and "listening"/"thinking"
   //   - and again after "idle" for kFollowupMs (in case AI asked a question)
   bool streaming_{false};
+  // Strict half-duplex latch. Once a reply begins, stale backend VAD events
+  // must not reopen the microphone until response-end and physical playback
+  // drain have both completed. A new wake may also clear it.
+  bool reply_playback_locked_{false};
   // Handsfree barge-in toggle, set from yaml (`barge_in:`). See set_barge_in().
   bool barge_in_{true};
   // Set on phase=idle when there's still TTS audio queued — we can't open
@@ -261,24 +291,21 @@ class VaClient : public Component {
   // key in hello) still gets the safe value rather than the old hardcoded 400.
   static constexpr uint32_t kWakeOpenDelayMs = 700;
   uint32_t wake_open_delay_ms_{kWakeOpenDelayMs};
-  // Playback jitter buffer ("prebuffer"). Before starting/resuming playback we
-  // hold audio in the PSRAM ring until at least this many ms have accumulated
-  // (or a short deadline elapses), so the downstream resampler/mixer/i2s chain
-  // starts with a cushion and a network jitter gap (we see 100-340 ms gaps)
-  // doesn't dry it out → audible crackle. Pushed from the backend `hello`
-  // ("playback_prebuffer_ms":N) so it's tunable without reflashing; clamped to
-  // kPlaybackPrebufferMaxMs. 0 = disabled (play immediately, old behaviour).
-  // Re-armed whenever the ring drains to empty (reply start AND post-underflow).
-  uint32_t playback_prebuffer_ms_{0};
+  // Playback watermarks. A reply starts only after the initial cushion has
+  // accumulated. During playback, crossing the low watermark pauses PSRAM
+  // drain; playback resumes at the high watermark. The downstream speaker
+  // buffers continue playing while PSRAM refills, hiding short network gaps.
+  // At response end, set_phase_("idle") permits the final sub-threshold tail.
+  uint32_t playback_prebuffer_ms_{1500};
   static constexpr uint32_t kPlaybackPrebufferMaxMs = 2000;
   static constexpr uint32_t kPlaybackSampleRate = 24000;  // incoming TTS PCM rate
-  // True while we're accumulating the prebuffer cushion (holding playback).
-  // Touched by handle_binary_ (WS task, arms it) + loop() (main task, releases);
-  // plain flag like streaming_, the tiny race is harmless.
-  bool playback_priming_{false};
-  // millis() when priming started (first byte after the ring was empty); used
-  // for the prime deadline so real-time (non-burst) audio still starts promptly.
-  uint32_t prime_started_ms_{0};
+  static constexpr uint32_t kPlaybackLowWaterMs = 300;
+  static constexpr uint32_t kPlaybackResumeWaterMs = 1000;
+  enum class PlaybackState : uint8_t { WAIT_INITIAL = 0, PLAYING, WAIT_REFILL };
+  PlaybackState playback_state_{PlaybackState::WAIT_INITIAL};
+  // Written by the WS task on phase=idle and read by loop(). Like the existing
+  // streaming gate, a one-loop-delay race is harmless.
+  bool response_audio_done_{false};
 
   // Resampler cold-start SILENCE-PRIME (crackle fix). The resampler does NOT
   // idle-timeout (verified vs ESPHome source): resample(stop_gracefully=false)
@@ -290,18 +317,16 @@ class VaClient : public Component {
   // zero state → a startup-transient click. A PSRAM prebuffer can't fix it (the
   // transient is downstream of the ring). Fix: when cold, feed kChainPrimeMs of
   // SILENCE first so the FIR settles to a clean zero output before real audio.
-  // Cold = resampler is_stopped() (precise, true exactly post-speaker.stop) OR,
-  // as a backup, nothing fed for > kChainColdMs. Both are only ever true at a
-  // real cold reply-start, never mid-speech; a needless prime on a warm chain is
-  // harmless (60ms silence).
+  // Cold is detected only from the real speaker state (or first-ever feed).
+  // An idle timer must not repeatedly classify ordinary network gaps as cold.
   static constexpr uint32_t kChainPrimeMs = 60;   // silence burst to warm the filter
-  static constexpr uint32_t kChainColdMs = 600;   // backup timer; is_stopped() is the primary signal
   // Bytes of silence still to feed this cold-start (24kHz mono 16-bit). >0 while
   // priming; loop() feeds silence and holds real-audio drain until it reaches 0.
   size_t chain_prime_remaining_{0};
   // millis() of the last time we fed the resampler ANYTHING (silence or real).
-  // Used to detect a cold chain: now - last_fed_ms_ > kChainColdMs. 0 = never fed.
+  // Zero means the chain has never been primed.
   uint32_t last_fed_ms_{0};
+  static constexpr size_t kFadeSamples = 240;  // 10 ms @ 24 kHz
   // Legacy compile-time default, kept for reference. The live value now comes
   // from the backend (followup_ms_); this stays 0 so a device talking to an
   // old backend that doesn't send follow_up_ms keeps the turn-based behaviour.
@@ -383,6 +408,7 @@ class VaClient : public Component {
   // emit fires (i.e. when the speaker has actually drained). Zero means
   // "not yet hit this milestone this turn".
   uint32_t turn_t_wake_{0};               // start_session() (wake-word handler)
+  uint32_t turn_t_first_mic_tx_{0};       // first PCM queued after a wake
   uint32_t turn_t_listening_{0};          // server's first phase=listening
   uint32_t turn_t_thinking_{0};           // server's phase=thinking (end-of-speech)
   uint32_t turn_t_first_audio_out_{0};    // first binary chunk arrived from server

@@ -1,7 +1,7 @@
 # ============================================================================
-# Home Assistant Voice PE - OpenAI Realtime firmware.
+# Home Assistant Voice PE - Qwen Realtime firmware.
 # Our customized thin-client: all voice logic lives in the va_client component
-# (pulled from GitHub), streaming audio to the OpenAI Realtime backend add-on.
+# (pulled from GitHub), streaming audio to the Qwen Realtime backend add-on.
 #
 # This config is meant to be pulled as a remote ESPHome `packages:` include from
 # a small per-device stub, so updates are one click in the dashboard (no more
@@ -53,7 +53,7 @@ substitutions:
   easter_egg_tick_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tick.mp3
   easter_egg_tada_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tada.mp3
   error_cloud_expired_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/error_cloud_expired.mp3
-  # WebSocket endpoint of the "OpenAI Realtime Voice Agent" Home Assistant
+  # WebSocket endpoint of the "Qwen Realtime Voice Agent" Home Assistant
   # add-on (this fork's backend). The add-on runs with host_network and
   # listens on port 8080. homeassistant.local resolves via mDNS on the LAN;
   # change this if your HA host has a different name/IP, e.g.
@@ -68,8 +68,8 @@ esphome:
   # Project identity drives the ESPHome dashboard "Update available" badge: bump
   # `version` on a release (merge to main) and adopted devices are offered it.
   project:
-    name: "xandervanerven.voice-pe-openai-realtime"
-    version: "1.2.0"
+    name: "haipeiwang.voice-pe-qwen-realtime"
+    version: "1.3.0-beta.1"
   min_version: 2026.5.0
   on_boot:
     priority: 375
@@ -130,6 +130,9 @@ esp32:
 wifi:
   id: wifi_id
   fast_connect: ${hidden_ssid}
+  # Last-resort recovery if the ESP32 Wi-Fi stack itself becomes unreachable.
+  # Normal AP roaming/reconnects finish well inside this window.
+  reboot_timeout: 5min
   # CRACKLE FIX (secondary): disable WiFi modem light-sleep. ESPHome's default
   # power_save_mode on ESP32 batches RX while the radio dozes, adding periodic
   # latency to incoming WS audio frames (the sub-second "ws audio gap" warnings).
@@ -373,7 +376,11 @@ switch:
     icon: "mdi:bullhorn"
     entity_category: config
     optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
+    # The mic remains gated until the local wake chime has both started and
+    # completely played out, followed by the backend-provided DAC-tail delay.
+    # This gives the user an unambiguous "speak now" boundary and prevents the
+    # chime from racing microphone capture or the first realtime reply.
+    restore_mode: ALWAYS_ON
   # Internal switch to track when a timer is ringing on the device.
   - platform: template
     id: timer_ringing
@@ -1295,6 +1302,22 @@ script:
       - delay: 800ms
       - script.execute: control_leds
 
+  # If the realtime bridge remains unreachable after its built-in reconnect
+  # attempts, wait once more for transient HAOS/router recovery and then reboot
+  # the Voice PE. This replaces a manual USB/power reset if the network task wedges.
+  - id: va_link_recovery_watchdog
+    mode: restart
+    then:
+      - delay: 2min
+      - if:
+          condition:
+            lambda: 'return id(wifi_id).is_connected() && !id(va)->is_connected();'
+          then:
+            - logger.log:
+                level: ERROR
+                format: "Realtime link still down after recovery window; rebooting Voice PE"
+            - button.press: restart_button
+
   # Script executed if voice_kit startup failed
   # Static red "X"
   - id: control_leds_voice_kit_startup_failed
@@ -1888,11 +1911,12 @@ external_components:
   - source:
       type: git
       url: https://github.com/esphome/home-assistant-voice-pe
-      ref: dev
+      ref: 5a4e7eec11cc6df75386de10b8f961a00dd8a82e
     components:
       - voice_kit
     refresh: 0s
-  # va_client (the OpenAI-realtime thin client) lives in THIS repo. It is pulled
+  # va_client (the Qwen-realtime thin client) and the patched AIC3204 driver live
+  # in THIS repo. They are pulled
   # from GitHub (public, no token) so the config builds without a local checkout.
   # ref selects the channel (main = stable, dev = WIP); refresh: 0s = always
   # fetch the latest C++ for that ref. To iterate on the C++ locally instead,
@@ -1900,9 +1924,9 @@ external_components:
   #   - source: {type: local, path: esphome/components}
   - source:
       type: git
-      url: https://github.com/xandervanerven/home-assistant-voice-pe
+      url: https://github.com/HaipeiWang/home-assistant-voice-pe-qwen
       ref: main
-    components: [va_client]
+    components: [va_client, aic3204]
     refresh: 0s
 
 # va-direct: forward device logs to a UDP sink container on the Pi so they
@@ -1984,11 +2008,10 @@ va_client:
           lambda: 'return phase == "replying";'
         then:
           - micro_wake_word.enable_model: stop
-          # B3: TTS is playing → use the stock-default ~0.50 (128) cutoff to
-          # reject the common reply-echo false stops (sliding-avg 0.41-0.49)
-          # while keeping real reply-stops (0.52-0.67). Dropped to 0.40 in the
-          # quiet follow-up/idle window below. (See the stop model comment.)
-          - lambda: 'id(stop).set_probability_cutoff(128);'
+          # TTS is playing: use a very strict ~0.90 cutoff. The measured 0.65
+          # threshold still fired on the assistant's own speaker echo and
+          # discarded the remaining reply. At rest it returns to 0.40.
+          - lambda: 'id(stop).set_probability_cutoff(230);'
           - script.stop: followup_window_watchdog
     # A turn is in flight ("listening" = the server VAD heard the user speak,
     # OR the follow-up window just opened its listening LED): stop the disarm
@@ -2027,6 +2050,7 @@ va_client:
         # audio_file id is `error_cloud_expired` (no "_sound" suffix),
         # unlike the other chimes — original yaml inconsistency.
         sound_file: "error_cloud_expired"
+    - script.execute: va_link_recovery_watchdog
   on_followup_opened:
     # Server's request_follow_up tool fired and va_client has waited
     # for the TTS hardware tail to clear (kTtsTailMs ≈ 800 ms after the
@@ -2093,9 +2117,9 @@ micro_wake_word:
     # removed on purpose. "stop" stays — it's the reliable barge-in/interrupt
     # word, armed only while the assistant is replying (see on_phase below).
     # kahrendt/microWakeWord redirects to the OHF-Voice org automatically.
-    - model: https://github.com/kahrendt/microWakeWord/releases/download/v2.1_models/alexa.json
+    - model: https://raw.githubusercontent.com/HaipeiWang/home-assistant-voice-pe-qwen/main/wake-models/alexa.json
       id: alexa
-    - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
+    - model: https://raw.githubusercontent.com/HaipeiWang/home-assistant-voice-pe-qwen/main/wake-models/stop.json
       id: stop
       internal: true
       # The model ships with cutoff 0.5. This baked 0.4 is only the boot/quiet
@@ -2125,6 +2149,7 @@ micro_wake_word:
   # follow-up window). Keep the gate (it still blocks non-speech noise
   # triggers for "alexa") but make it easier to satisfy.
   vad:
+    model: https://raw.githubusercontent.com/HaipeiWang/home-assistant-voice-pe-qwen/main/wake-models/vad.json
     probability_cutoff: 0.3
   on_wake_word_detected:
     # TEMP DEBUG (va-direct): log EVERY detection BEFORE the mute guard, so the
@@ -2217,12 +2242,19 @@ micro_wake_word:
                                       id: play_sound
                                       priority: true
                                       sound_file: "wake_word_triggered_sound"
+                                  # First observe the announcement start, then
+                                  # wait for its real end before opening capture.
+                                  - wait_until:
+                                      condition:
+                                        media_player.is_announcing:
+                                          id: external_media_player
+                                      timeout: 750ms
                                   - wait_until:
                                       condition:
                                         not:
                                           media_player.is_announcing:
                                             id: external_media_player
-                                      timeout: 2s
+                                      timeout: 3s
                                   # Downstream ring tail — keep the chime
                                   # off the mic so XMOS AEC doesn't leak it
                                   # back as "Ok, nabu" into the new turn.
@@ -2259,16 +2291,9 @@ micro_wake_word:
                                       priority: true
                                       sound_file: "error_cloud_expired"
                                 else:
-                                  # Regular wake word: play wake chime, start a new session.
-                                  # Stop the TTS playback chain first. The previous turn may
-                                  # still have downstream ring residual (~600 ms) even after
-                                  # the server said phase=idle — start_session()'s internal
-                                  # send_interrupt() flushes the PSRAM queue, but the leaf's
-                                  # own ring buffers it can't reach. Without this stop the
-                                  # tail of the old reply leaks under the wake chime.
-                                  # No-op when there's nothing playing.
-                                  - speaker.stop:
-                                      id: media_resampling_speaker
+                                  # Regular wake: keep the realtime resampler/I2S
+                                  # chain alive. Explicit stop is reserved for a
+                                  # real user interrupt, never an ordinary turn.
                                   - if:
                                       condition:
                                         switch.is_on: wake_sound
@@ -2284,10 +2309,15 @@ micro_wake_word:
                                         # (which transcribed it as "Ok, nabu").
                                         - wait_until:
                                             condition:
+                                              media_player.is_announcing:
+                                                id: external_media_player
+                                            timeout: 750ms
+                                        - wait_until:
+                                            condition:
                                               not:
                                                 media_player.is_announcing:
                                                   id: external_media_player
-                                            timeout: 2s
+                                            timeout: 3s
                                         # Downstream i2s_audio_speaker ring buffer is
                                         # still draining. Tunable from the add-on
                                         # (wake_open_delay_ms, default 700) via the

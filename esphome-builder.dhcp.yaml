@@ -1,5 +1,5 @@
 # ============================================================================
-# Per-device stub for the OpenAI Realtime Voice PE firmware.
+# Per-device stub for the Qwen Realtime Voice PE firmware.
 #
 # Copy THIS into your ESPHome dashboard ONCE (add/adopt the device, then edit its
 # YAML). It pulls the full firmware from this repo as a remote `packages:` include,
@@ -26,13 +26,13 @@ substitutions:
 # every compile fetch the latest release.
 packages:
   realtime:
-    url: https://github.com/xandervanerven/home-assistant-voice-pe
+    url: https://github.com/HaipeiWang/home-assistant-voice-pe-qwen
     ref: main
     files: [home-assistant-voice.realtime.yaml]
     refresh: 0s
 
 dashboard_import:
-  package_import_url: github://xandervanerven/home-assistant-voice-pe/home-assistant-voice.realtime.yaml@main
+  package_import_url: github://HaipeiWang/home-assistant-voice-pe-qwen/home-assistant-voice.realtime.yaml@main
   import_full_config: false
 
 # --- Fixed (static) IP? -----------------------------------------------------

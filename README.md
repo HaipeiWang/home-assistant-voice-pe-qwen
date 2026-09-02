@@ -1,81 +1,95 @@
-# Home Assistant Voice PE — OpenAI Realtime 2 fork
+# Home Assistant Voice PE for Qwen Realtime
 
-> [!IMPORTANT]
-> **This is 1 of 2 repos — you need both halves.** This repo is the **device
-> firmware**; on its own it does nothing. It streams audio to a backend add-on that
-> runs the OpenAI Realtime session and controls Home Assistant. You must set up both:
-> - 🔌 **Device firmware** (this repo) — flashed onto the Voice PE
-> - 🧠 **Backend add-on** → **[xandervanerven/ha-openai-realtime](https://github.com/xandervanerven/ha-openai-realtime)** (runs in Home Assistant)
->
-> 📖 New here? The full **[INSTALL guide](INSTALL.md)** sets up both halves, step by step.
+[中文](README.zh-CN.md) | English
 
-> **Customized fork** of `maxmaxme/home-assistant-voice-pe` (itself a fork of
-> `esphome/home-assistant-voice-pe`). The Voice PE runs as a **thin client**: it
-> streams microphone audio over a plain WebSocket to a backend add-on, which runs
-> an **OpenAI Realtime API** session (`gpt-realtime-2`) for speech-to-speech and
-> controls Home Assistant through the official
-> **[Home Assistant MCP Server](https://www.home-assistant.io/integrations/mcp_server/)**
-> integration. There is no Home Assistant `voice_assistant` pipeline on the audio
-> path — STT, TTS and the LLM all live in the Realtime session inside the add-on.
->
-> The firmware config is [`home-assistant-voice.realtime.yaml`](home-assistant-voice.realtime.yaml).
-> You don't paste it directly — you adopt it via a tiny per-device stub
-> ([`esphome-builder.dhcp.yaml`](esphome-builder.dhcp.yaml)) that pulls it as a remote package,
-> so updates are **one click** in the ESPHome dashboard (see Setup).
+Custom firmware that turns Home Assistant Voice: Preview Edition into a thin,
+full-duplex client for the
+[Qwen Realtime Voice Agent add-on](https://github.com/HaipeiWang/ha-qwen-realtime-voice-agent).
+The device performs the wake-word, microphone, speaker and LED work; Qwen handles
+speech understanding and speech generation, while the add-on exposes Home Assistant
+tools to the model.
 
-## What this fork changes vs. upstream
+> This repository is a fork of
+> [xandervanerven/home-assistant-voice-pe](https://github.com/xandervanerven/home-assistant-voice-pe),
+> which is based on the official Home Assistant Voice PE ESPHome project.
 
-- **Custom `va_client` component** replaces the stock `voice_assistant`
-  component: a thin WebSocket client (mic up / speaker down + an idle → listening
-  → thinking → replying phase/LED state machine). All the voice intelligence
-  runs in the backend add-on, not on the device.
-- **One-click updates**: instead of pasting the whole config, you adopt a tiny
-  per-device stub that pulls the firmware from this repo as a remote ESPHome
-  `packages:` include. When a new version ships, the ESPHome dashboard shows
-  "Update available" — one click recompiles with the latest. No local checkout,
-  no tokens (this repo is public).
-- **"stop" word + button interrupt**: say *"stop"* while the assistant is
-  talking, or press the center button, to cancel the reply. This is the reliable
-  way to interrupt.
-- **Conversational, with online answers**: because the brain is `gpt-realtime-2`
-  in the backend, you get a natural back-and-forth — and with web search enabled it
-  can look things up online (weather, news, facts), not just control your devices.
+## What is included
 
-## Setup (ESPHome Builder)
+- `va_client`: the tested WebSocket audio/state client used by Voice PE.
+- Patched `aic3204` audio component required by the playback path.
+- Wake chime gating: microphone capture starts only after the chime has really ended.
+- Explicit `conversation_end`, generation-safe sessions and clean reconnect behavior.
+- Warm resampler/I2S playback path and stricter echo rejection during replies.
+- Automatic connection to `ws://homeassistant.local:8080/` by default.
+- Remote ESPHome packages, so later firmware updates can be installed from the
+  ESPHome dashboard.
 
-1. Install and configure the **OpenAI Realtime 2 Voice Agent** add-on from
-   [xandervanerven/ha-openai-realtime](https://github.com/xandervanerven/ha-openai-realtime)
-   (sets your OpenAI API key, the model, and the Home Assistant MCP connection).
-2. In **Builder → Secrets**, add the keys from
-   [`secrets.yaml.example`](secrets.yaml.example): `wifi_ssid`, `wifi_password`,
-   `ota_password`, `api_key` (plus `static_ip`/`gateway`/`subnet`/`dns1`/`dns2`
-   only if you want a fixed IP).
-3. Create a new device in the dashboard and replace its YAML with a ready-made
-   stub — [`esphome-builder.dhcp.yaml`](esphome-builder.dhcp.yaml) for DHCP, or
-   [`esphome-builder.static-ip.yaml`](esphome-builder.static-ip.yaml) for a fixed IP.
-   Set `name`/`friendly_name` and keep the `packages:`/`dashboard_import:` lines.
-   Optionally override the `va_url` substitution if your add-on isn't at
-   `ws://homeassistant.local:8080/`.
-4. **Install** once (USB, then wireless thereafter). The device adopts the
-   firmware and connects to the add-on.
+## Required companion add-on
 
-After that, when a new firmware version is released the dashboard shows
-**"Update available"** for the device — click it to pull the latest config and
-re-flash. No more copy-pasting.
+Install and configure
+[HaipeiWang/ha-qwen-realtime-voice-agent](https://github.com/HaipeiWang/ha-qwen-realtime-voice-agent)
+before testing the device. The firmware does not contain a Qwen API key and does not
+connect to Qwen directly.
 
-## Known limitations
+## First installation
 
-- **No voice timers or alarms yet** — every other Assist action (lights, switches,
-  scenes, climate) and online questions work.
-- **A brief reconnect about once an hour** (OpenAI's 60-minute session cap; the
-  add-on refreshes proactively during a quiet moment, so it rarely interrupts).
-- **Rarely, the assistant may stop itself** on a word in its own reply that sounds
-  like "stop" — just ask again.
-- **Using "stop":** interrupts the assistant *while it's speaking* (during a reply
-  or the short listening window right after one); it has no effect before it has
-  started answering.
+1. Install **ESPHome Device Builder** in Home Assistant.
+2. Add the following repository to the Home Assistant Add-on Store and install its
+   Qwen Realtime add-on:
+   `https://github.com/HaipeiWang/ha-qwen-realtime-voice-agent`
+3. In the add-on configuration, provide your DashScope API key and the settings
+   required for your Qwen model, then start the add-on. Keep port `8080` reachable
+   from the Voice PE LAN.
+4. In ESPHome Builder, put the values shown in
+   [`secrets.yaml.example`](secrets.yaml.example) into your own `secrets.yaml`.
+5. Copy either [`esphome-builder.dhcp.yaml`](esphome-builder.dhcp.yaml) or
+   [`esphome-builder.static-ip.yaml`](esphome-builder.static-ip.yaml) into the
+   device configuration. Change only the device name and any needed substitutions.
+6. Perform the first flash over USB. Later builds can be installed over Wi-Fi.
 
----
+The default backend address is `ws://homeassistant.local:8080/`. If that mDNS name
+does not resolve on your network, add this substitution to the per-device stub:
 
-Based on the ESPHome source of the [Home Assistant Voice: Preview Edition](https://www.home-assistant.io/voice-pe/).
-See [the upstream documentation](https://voice-pe.home-assistant.io/) for hardware setup and troubleshooting.
+```yaml
+substitutions:
+  va_url: "ws://YOUR_HOME_ASSISTANT_ADDRESS:8080/"
+```
+
+## Automatic discovery and connection
+
+After a successful first flash:
+
+- ESPHome advertises the device on the LAN and Home Assistant discovers its native
+  API connection automatically. The user may still need to click **Configure** in
+  Home Assistant to accept a newly discovered device.
+- `va_client` resolves `homeassistant.local`, connects to the add-on WebSocket, and
+  reconnects automatically after temporary network or add-on interruptions.
+- The add-on independently reads the entities exposed to Assist, builds its Qwen
+  tool definitions at startup, and registers those tools for each Qwen session.
+
+Wi-Fi credentials, the ESPHome API encryption key and OTA password are necessarily
+device-specific and must be supplied during first installation. No public firmware
+can discover those secrets automatically.
+
+## Verify
+
+1. Start the Qwen add-on and confirm its log shows Home Assistant MCP initialization,
+   exposed-entity discovery and generated tool counts.
+2. Power on the Voice PE. Its log should show a WebSocket connection to port `8080`.
+3. Say **Alexa**, wait for the wake chime, then ask a general question.
+4. Ask it to control an entity that is exposed to Assist and confirm both the entity
+   state and spoken reply.
+5. End the follow-up window and confirm the log contains `conversation_end` and the
+   Qwen session closes only after playback drains.
+
+See the full [installation and troubleshooting guide](INSTALL.md).
+
+## Version
+
+This branch currently publishes firmware `1.3.0-beta.1`. It is a test release based
+on physical Voice PE and HAOS add-on validation completed before publication.
+
+## License and upstream
+
+See [LICENSE](LICENSE). Hardware background and stock firmware documentation remain
+available from [Home Assistant Voice PE](https://voice-pe.home-assistant.io/).
